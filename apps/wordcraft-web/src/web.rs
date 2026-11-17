@@ -13,6 +13,7 @@ const DOC_EXTS: &[&str] =
     &["docx", "docm", "dotx", "dotm", "doc", "dot", "odt", "ott", "fodt", "rtf", "txt", "md", "html", "htm", "mht", "mhtml", "tex", "json", "xml"];
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "bmp", "wmf", "emf"];
 const RECIPIENT_EXTS: &[&str] = wordcraft_engine::cmd::mailings::RECIPIENT_EXTENSIONS;
+mod dictionaries;
 mod font_store;
 const CANVAS_ID: &str = "wordcraft_canvas";
 const LOADING_ID: &str = "wordcraft_loading";
@@ -28,6 +29,8 @@ pub fn start() {
             log::error!("missing <canvas id=\"{CANVAS_ID}\">");
             return;
         };
+        // Spelling dictionaries the site serves (`dictionaries/`), before any text is proofed.
+        dictionaries::load_all().await;
         // Host modes (`craft-web-host`): `?host=parent`, a same-origin page framing WordCraft, opens documents in
         // it and stores what it saves (`host`); unframed there is no parent, so that URL on its
         // own stays the normal app with downloads. `data-host="page"` on the canvas opts a page

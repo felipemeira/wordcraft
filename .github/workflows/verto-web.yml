@@ -1,0 +1,75 @@
+# Verto: the web build with the Brazilian Portuguese spelling dictionary served beside it.
+# Same steps as the suite's release web job (storytold/craft-common-actions release.yml `web`),
+# plus dictionaries/pt_BR.{aff,dic} (VERO, LibreOffice dictionaries, LGPLv3/MPL) in the site.
+name: Verto web (pt-BR)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [verto-ptbr]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verto-web-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # LibreOffice/dictionaries commit the pt_BR files are taken from.
+  DICT_REF: 1e848fbddd7fd8e03fb696ecc03ee1068fab141c
+  CRAFT_FONTS_REF: b076417b5880bd4154bd22f00695b1d28c6bea83
+
+jobs:
+  web:
+    name: Web (wasm) + pt-BR
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: step-security/dtolnay-rust-toolchain@8dd607977d06adf4ed49b190381e74c17a9dd25f # v1.0.0
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - uses: step-security/rust-cache@8871c8ba063416da7c32246932ea6ae08700453e # v2.9.2
+        with:
+          key: verto-web
+      - uses: storytold/craft-common-actions/actions/install-trunk@main
+      - name: Check out craft-fonts
+        uses: storytold/craft-common-actions/actions/checkout-craft-fonts@main
+        with:
+          ref: ${{ env.CRAFT_FONTS_REF }}
+      - name: Check out craft-i18n
+        uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+      - name: Build and zip
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CRAFT_FONTS_REQUIRED: "1"
+        run: packaging/web/package.sh
+      - name: Add the pt_BR dictionary
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          unzip -q dist/release/wordcraft-web-*.zip -d out
+          site=$(ls -d out/wordcraft-web-*)
+          mkdir -p "$site/dictionaries"
+          base="https://raw.githubusercontent.com/LibreOffice/dictionaries/$DICT_REF/pt_BR"
+          for f in pt_BR.aff pt_BR.dic README_pt_BR.txt; do
+            curl --proto '=https' -fsSL -o "$site/dictionaries/$f" "$base/$f"
+          done
+          # UTF-8 already (SET UTF-8); drop a byte-order mark so the first line parses as SET.
+          sed -i '1s/^\xEF\xBB\xBF//' "$site/dictionaries/pt_BR.aff" "$site/dictionaries/pt_BR.dic"
+          head -1 "$site/dictionaries/pt_BR.aff"
+          ls -l "$site/dictionaries"
+          echo "SITE=$site" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wordcraft-web-verto
+          path: ${{ env.SITE }}
+          if-no-files-found: error
+          retention-days: 30
