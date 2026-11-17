@@ -183,7 +183,7 @@ impl Default for ViewState {
             marks: false,
             ruler: true,
             gridlines: false,
-            table_gridlines: true,
+            table_gridlines: false,
             nav_pane: false,
             styles_pane: false,
             styles_pane_dock: StylesPaneDock::Right,

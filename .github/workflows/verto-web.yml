@@ -1,6 +1,7 @@
 # Verto: the web build with the Brazilian Portuguese spelling dictionary served beside it.
 # Same steps as the suite's release web job (storytold/craft-common-actions release.yml `web`),
-# plus dictionaries/pt_BR.{aff,dic} (VERO, LibreOffice dictionaries, LGPLv3/MPL) in the site.
+# plus dictionaries/pt_BR.{aff,dic} (VERO, LibreOffice dictionaries, LGPLv3/MPL, with Verto's
+# forbidden words from packaging/verto/pt_BR-proibidas.txt) and fonts/ (Noto Color Emoji, OFL).
 name: Verto web (pt-BR)
 
 on:
@@ -19,6 +20,8 @@ env:
   # LibreOffice/dictionaries commit the pt_BR files are taken from.
   DICT_REF: 1e848fbddd7fd8e03fb696ecc03ee1068fab141c
   CRAFT_FONTS_REF: b076417b5880bd4154bd22f00695b1d28c6bea83
+  # googlefonts/noto-emoji commit the emoji font is taken from (OFL 1.1).
+  EMOJI_REF: 1ffdd21391dd1f25c081fa93a9dea0c7c029442b
 
 jobs:
   web:
@@ -65,8 +68,29 @@ jobs:
           # UTF-8 already (SET UTF-8); drop a byte-order mark so the first line parses as SET.
           sed -i '1s/^\xEF\xBB\xBF//' "$site/dictionaries/pt_BR.aff" "$site/dictionaries/pt_BR.dic"
           head -1 "$site/dictionaries/pt_BR.aff"
+          # Verto's forbidden words: listed with the dictionary's FORBIDDENWORD flag, so they are
+          # errors however the affixes could build them.
+          flag=$(awk '$1 == "FORBIDDENWORD" { print $2; exit }' "$site/dictionaries/pt_BR.aff")
+          [ -n "$flag" ] || { echo "::error::pt_BR.aff has no FORBIDDENWORD flag"; exit 1; }
+          words=$(grep -v '^\s*#' packaging/verto/pt_BR-proibidas.txt | sed 's/\s*$//' | grep -v '^$' || true)
+          n=$(printf '%s\n' "$words" | grep -c . || true)
+          if [ "$n" -gt 0 ]; then
+            [ -z "$(tail -c1 "$site/dictionaries/pt_BR.dic")" ] || echo >> "$site/dictionaries/pt_BR.dic"
+            printf '%s\n' "$words" | sed "s|\$|/$flag|" >> "$site/dictionaries/pt_BR.dic"
+            count=$(head -1 "$site/dictionaries/pt_BR.dic" | tr -dc '0-9')
+            sed -i "1s/.*/$((count + n))/" "$site/dictionaries/pt_BR.dic"
+            echo "forbidden words: $n (flag $flag)"; tail -n "$n" "$site/dictionaries/pt_BR.dic"
+          fi
           ls -l "$site/dictionaries"
           echo "SITE=$site" >> "$GITHUB_ENV"
+      - name: Add the emoji font
+        run: |
+          set -euo pipefail
+          mkdir -p "$SITE/fonts"
+          base="https://raw.githubusercontent.com/googlefonts/noto-emoji/$EMOJI_REF/2D/fonts"
+          curl --proto '=https' -fsSL -o "$SITE/fonts/Noto-COLRv1-noflags.ttf" "$base/Noto-COLRv1-noflags.ttf"
+          curl --proto '=https' -fsSL -o "$SITE/fonts/OFL-noto-color-emoji.txt" "$base/LICENSE"
+          ls -l "$SITE/fonts"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wordcraft-web-verto
