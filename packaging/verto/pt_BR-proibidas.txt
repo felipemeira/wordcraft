@@ -1,4 +1,3 @@
 # Palavras que o dicionário pt_BR (VERO) aceita mas que, no Verto, devem ser marcadas como erro.
 # Uma por linha; linhas com # são ignoradas. Viram entradas FORBIDDENWORD no pt_BR.dic do build web.
-# mermo: conjugação de "mermar" (diminuir), quase sempre um erro de "mesmo".
-mermo
+# (vazia: "mermo" saiu porque é palavra válida — conjugação de "mermar" — e o Word também a aceita)

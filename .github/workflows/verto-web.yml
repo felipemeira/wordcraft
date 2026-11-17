@@ -22,6 +22,8 @@ env:
   CRAFT_FONTS_REF: b076417b5880bd4154bd22f00695b1d28c6bea83
   # googlefonts/noto-emoji commit the emoji font is taken from (OFL 1.1).
   EMOJI_REF: 1ffdd21391dd1f25c081fa93a9dea0c7c029442b
+  # google/fonts commit Arimo, Carlito and Tinos are taken from (OFL 1.1).
+  GFONTS_REF: 7af0d90b4d532ffa4b041937b560c6df4e7b1e95
 
 jobs:
   web:
@@ -90,6 +92,21 @@ jobs:
           base="https://raw.githubusercontent.com/googlefonts/noto-emoji/$EMOJI_REF/2D/fonts"
           curl --proto '=https' -fsSL -o "$SITE/fonts/Noto-COLRv1-noflags.ttf" "$base/Noto-COLRv1-noflags.ttf"
           curl --proto '=https' -fsSL -o "$SITE/fonts/OFL-noto-color-emoji.txt" "$base/LICENSE"
+      - name: Add metric-compatible fonts for Arial, Calibri and Times New Roman
+        run: |
+          set -euo pipefail
+          g="https://raw.githubusercontent.com/google/fonts/$GFONTS_REF/ofl"
+          get() { curl --proto '=https' -fsSL -o "$SITE/fonts/$2" "$g/$1"; }
+          get "arimo/Arimo%5Bwght%5D.ttf" Arimo-Variable.ttf
+          get "arimo/Arimo-Italic%5Bwght%5D.ttf" Arimo-Italic-Variable.ttf
+          get arimo/OFL.txt OFL-arimo.txt
+          for s in Regular Bold Italic BoldItalic; do
+            get "carlito/Carlito-$s.ttf" "Carlito-$s.ttf"
+            get "tinos/Tinos-$s.ttf" "Tinos-$s.ttf"
+          done
+          get carlito/OFL.txt OFL-carlito.txt
+          # Tinos has no OFL.txt in google/fonts; its METADATA.pb names the licence (OFL).
+          get tinos/METADATA.pb LICENSE-tinos-METADATA.pb
           ls -l "$SITE/fonts"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

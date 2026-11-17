@@ -13,7 +13,21 @@ use wasm_bindgen::JsCast as _;
 const DIR: &str = "./fonts";
 
 /// Font files a site may serve.
-const SERVED: &[&str] = &["Noto-COLRv1-noflags.ttf"];
+const SERVED: &[&str] = &[
+    "Noto-COLRv1-noflags.ttf",
+    // Metric-compatible stand-ins for Word's fonts: Arimo for Arial, Carlito for Calibri, Tinos for
+    // Times New Roman. The substitutes already prefer them, so text keeps Word's line breaks.
+    "Arimo-Variable.ttf",
+    "Arimo-Italic-Variable.ttf",
+    "Carlito-Regular.ttf",
+    "Carlito-Bold.ttf",
+    "Carlito-Italic.ttf",
+    "Carlito-BoldItalic.ttf",
+    "Tinos-Regular.ttf",
+    "Tinos-Bold.ttf",
+    "Tinos-Italic.ttf",
+    "Tinos-BoldItalic.ttf",
+];
 
 /// Fetch and add every served font the site has.
 pub async fn load_all() {
