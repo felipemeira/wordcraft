@@ -177,7 +177,10 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                         // The gaps (6 + 4 + 8) and the strip's margin.
                         spaced(share_button) + spaced(editing) + spaced(comment) + 18.0 + 12.0
                     };
-                    let button_levels = [button_widths(0), button_widths(1), button_widths(2)];
+                    // Verto: the Close (×) beside Share, in the page that keeps the document.
+                    let host_close = app.services.close_document.is_some();
+                    let close_w = if host_close { 34.0 } else { 0.0 };
+                    let button_levels = [button_widths(0) + close_w, button_widths(1) + close_w, button_widths(2) + close_w];
                     let labels: Vec<&str> = tabs.iter().map(|(tab, custom)| if *custom { tab.as_str() } else { tl!(tab) }).collect();
                     let specs: Vec<TabSpec> = tabs
                         .iter()
@@ -196,6 +199,13 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                         // tabs took clicks that did nothing, so the empty window had no way back to
                         // the Start screen (#3045).
                         ui.add_enabled_ui(app.has_document(), |ui| {
+                            if host_close {
+                                let close = crate::widgets::icon_only_button(ui, "close", tl!("Close"), regular(12.0), false);
+                                if close.clicked() {
+                                    let _ = app.run("ui.hostClose", json!({}));
+                                }
+                                ui.add_space(6.0);
+                            }
                             let (share_size, share_text) =
                                 if plan.buttons < 2 { (((share_w + 36.0).max(74.0), 24.0), true) } else { ((30.0, 24.0), false) };
                             let (r, resp) = ui.allocate_exact_size(vec2(share_size.0, share_size.1), Sense::click());
@@ -219,8 +229,14 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                                 );
                             }
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, share));
-                            if resp.on_hover_text(tl!("Export a copy to share (PDF, Word document)")).clicked() {
-                                let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));
+                            // Verto: the page's own sharing dialog (who may read and edit).
+                            let hint = if app.services.share.is_some() { tl!("Who can read and edit this document") } else { tl!("Export a copy to share (PDF, Word document)") };
+                            if resp.on_hover_text(hint).clicked() {
+                                if let Some(share) = &app.services.share {
+                                    share();
+                                } else {
+                                    let _ = app.run("ui.backstage", json!({"value": true, "page": "export"}));
+                                }
                             }
                             ui.add_space(6.0);
                             let track = app.session.doc.settings.track_changes;

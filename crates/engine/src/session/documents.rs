@@ -257,6 +257,7 @@ impl Session {
             clip_history: _,
             registry: _,
             author: _,
+            read_only: _,
             initials: _,
             painter: _,
             copied_format: _,

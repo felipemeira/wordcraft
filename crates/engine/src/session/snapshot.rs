@@ -90,6 +90,7 @@ impl Session {
             page_hint: _,
             registry: _,
             author: _,
+            read_only: _,
             initials: _,
             painter: _,
             copied_format: _,
@@ -261,6 +262,7 @@ impl Session {
     pub fn why_disabled(&self, id: &str) -> Option<&'static str> {
         let spec = self.registry.get(id)?;
         (spec.enabled)(self)
+            .or_else(|| (spec.mutates && self.read_only).then_some(super::READ_ONLY))
             .or_else(|| crate::cmd::md_source::refusal(self, id, spec.mutates))
             .or_else(|| if spec.mutates { crate::cmd::protect::greyed_out(self, id, || self.protect_facts()) } else { None })
     }

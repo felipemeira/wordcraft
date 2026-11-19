@@ -111,6 +111,13 @@ pub fn start() {
                         crate::host::Bridge::set_author(&mut app, &author);
                         prefs.keep_own_author(&app.session.author, &own);
                     }
+                    // Verto: Share and Close (×) go to the page, and `?readonly=1` opens the document
+                    // only to read.
+                    if app_bridge.is_some() {
+                        app.services.share = Some(Box::new(|| post_to_page("wordcraft:share-request")));
+                        app.services.close_document = Some(Box::new(|| post_to_page("wordcraft:close-request")));
+                        app.session.read_only = query_param("readonly").is_some_and(|v| v == "1");
+                    }
                     Ok(Box::new(WebShell { app, inbox, messages, prefs }))
                 }),
             )
@@ -133,6 +140,18 @@ pub fn start() {
 
 fn query() -> String {
     web_sys::window().and_then(|w| w.location().search().ok()).unwrap_or_default()
+}
+
+/// Verto: a message of this kind to the page that frames the app (same origin only).
+fn post_to_page(kind: &str) {
+    let Some(window) = web_sys::window() else { return };
+    let Ok(Some(parent)) = window.parent() else { return };
+    let Ok(origin) = window.location().origin() else { return };
+    let message = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(&message, &wasm_bindgen::JsValue::from_str("type"), &wasm_bindgen::JsValue::from_str(kind));
+    if let Err(e) = parent.post_message(&message, &origin) {
+        log::warn!("couldn't post {kind}: {e:?}");
+    }
 }
 
 fn query_param(key: &str) -> Option<String> {

@@ -107,6 +107,7 @@ impl Session {
             page_hint,
             registry,
             author: "WordCraft User".into(),
+            read_only: false,
             initials: String::new(),
             painter: None,
             copied_format: None,

@@ -787,6 +787,13 @@ impl WordApp {
                     json!({"pending": "discardRecovery"})
                 }
             }
+            // Verto: the page takes the document back (after Save Changes, see `discards_document`).
+            "ui.hostClose" => {
+                if let Some(close) = &self.services.close_document {
+                    close();
+                }
+                json!({})
+            }
             "ui.saveChanges" => {
                 let Some(choice) = s("answer").and_then(SaveChoice::parse) else {
                     return Some(Err("`answer` must be save, dontSave or cancel".into()));
@@ -1174,6 +1181,7 @@ pub(crate) fn works_without_document(id: &str) -> bool {
             | "ui.animations"
             | "ui.language"
             | "ui.saveChanges"
+            | "ui.hostClose"
             | "ui.openFileDialog"
             | "ui.printCancel"
             | "ui.fileBrowser"
@@ -1214,5 +1222,6 @@ fn flushes_comment_drafts(id: &str, params: &Value) -> bool {
 /// Envelopes, Labels, Finish & Merge and Print Documents open their document beside it (Open and restoring
 /// replace only an untouched blank document, which has nothing to lose).
 pub(crate) fn discards_document(id: &str, _params: &Value) -> bool {
-    id == "file.close"
+    // Verto: closing in the page that keeps the document asks about unsaved changes too.
+    id == "file.close" || id == "ui.hostClose"
 }

@@ -101,6 +101,10 @@ impl Session {
         if let Some(why) = (spec.enabled)(self) {
             return Err(CmdError::Disabled(format!("{id}: {why}")));
         }
+        // Verto: a document opened only to read refuses every change.
+        if spec.mutates && self.read_only {
+            return Err(CmdError::Disabled(super::READ_ONLY.to_string()));
+        }
         // Restrict Editing: refused outright, or allowed as long as it only edits the exceptions.
         let guard = if spec.mutates { crate::cmd::protect::check_before(self, id, params)? } else { false };
         // Quick Parts aren't part of the document, so a refused edit puts them back itself (the Spike).

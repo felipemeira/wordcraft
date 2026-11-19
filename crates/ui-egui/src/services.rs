@@ -27,6 +27,11 @@ pub struct Services {
     pub cancel_file_dialog: Option<Box<dyn Fn()>>,
     /// Web: open a file picker; the file arrives later through `inbox`.
     pub open_async: Option<Box<dyn Fn(&str)>>,
+    /// Verto (host mode): Share asks the page for its own sharing dialog (who may read and edit).
+    pub share: Option<Box<dyn Fn()>>,
+    /// Verto (host mode): the Close (×) beside Share hands the document back to the page, after the
+    /// Save Changes question (`ui.hostClose`).
+    pub close_document: Option<Box<dyn Fn()>>,
     /// Web: files (name, bytes) delivered asynchronously (picker, drag and drop).
     pub inbox: Option<Inbox>,
     /// Web: pictures pasted from the browser's clipboard (the bytes; the name is ignored). Kept

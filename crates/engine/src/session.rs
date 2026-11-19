@@ -41,6 +41,9 @@ pub use snapshot_types::EditSnapshot;
 use snapshot_types::{LayoutSlots, RunSnapshot};
 pub use view::{StylesPaneDock, ViewState};
 
+/// Verto: why a document opened only to read refuses a change.
+pub const READ_ONLY: &str = "Este documento está aberto só para leitura.";
+
 /// An editing session: the app-wide state (clipboard, preferences, macros, the command registry…)
 /// and the open documents. The active document's state is in the session's own fields, which
 /// every command works on; the other open documents wait in [`DocState`] values and are swapped
@@ -84,6 +87,9 @@ pub struct Session {
     pub registry: Arc<Registry>,
     /// Author name for comments and tracked changes.
     pub author: String,
+    /// Verto: this person may only read the document (`?readonly=1`). Commands that change it are
+    /// refused; reading, selecting, copying and finding still work. Not saved with the document.
+    pub read_only: bool,
     /// Initials for comments (File › Options › General); empty = the name's initials.
     pub initials: String,
     /// Format painter: copied formatting waiting to be applied (and whether it stays on).
