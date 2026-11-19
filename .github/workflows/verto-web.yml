@@ -51,6 +51,8 @@ jobs:
           ref: ${{ env.CRAFT_FONTS_REF }}
       - name: Check out craft-i18n
         uses: storytold/craft-common-actions/actions/checkout-craft-i18n@main
+      - name: Test co-editing
+        run: cargo test --locked -p wordcraft-engine --lib collab
       - name: Build and zip
         env:
           CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts

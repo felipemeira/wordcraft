@@ -179,7 +179,8 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                     };
                     // Verto: the Close (×) beside Share, in the page that keeps the document.
                     let host_close = app.services.close_document.is_some();
-                    let close_w = if host_close { 34.0 } else { 0.0 };
+                    let peers_shown = app.session.collab_peers.len().min(6);
+                    let close_w = if host_close { 34.0 } else { 0.0 } + 28.0 * peers_shown as f32;
                     let button_levels = [button_widths(0) + close_w, button_widths(1) + close_w, button_widths(2) + close_w];
                     let labels: Vec<&str> = tabs.iter().map(|(tab, custom)| if *custom { tab.as_str() } else { tl!(tab) }).collect();
                     let specs: Vec<TabSpec> = tabs
@@ -229,6 +230,18 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                                 );
                             }
                             resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, share));
+                            // Verto: who else is editing this document, in their colours, as Word
+                            // shows them beside Share.
+                            for peer in app.session.collab_peers.iter().take(peers_shown) {
+                                let (r, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+                                let fill = egui::Color32::from_rgb(peer.color[0], peer.color[1], peer.color[2]);
+                                ui.painter().circle_filled(r.center(), 11.0, fill);
+                                ui.painter().circle_stroke(r.center(), 11.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                                let initials: String =
+                                    peer.name.split_whitespace().filter_map(|w| w.chars().next()).take(2).flat_map(char::to_uppercase).collect();
+                                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, initials, egui::FontId::proportional(10.0), egui::Color32::WHITE);
+                                let _ = resp.on_hover_text(peer.name.clone());
+                            }
                             // Verto: the page's own sharing dialog (who may read and edit).
                             let hint = if app.services.share.is_some() { tl!("Who can read and edit this document") } else { tl!("Export a copy to share (PDF, Word document)") };
                             if resp.on_hover_text(hint).clicked() {

@@ -1915,6 +1915,22 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
                 ime_geometry = Some((cr, cr));
             }
         }
+        // Verto: the others' carets in a shared document, in their colours, with their names.
+        for peer in app.session.collab_peers.clone() {
+            let Some(pos) = app.session.collab_peer_pos(&peer.block, peer.off) else { continue };
+            let Some(c) = layout.caret_on(&pos, 0) else { continue };
+            let Some(pr) = rects.get(c.page) else { continue };
+            let scale = layout.pages.get(c.page).map_or(geo.scale, |page| page_screen_scale(*pr, page, geo.scale));
+            let x = (pr.min.x + c.x * scale).round() + 0.5;
+            let (y0, y1) = (pr.min.y + c.top * scale, pr.min.y + (c.top + c.height) * scale);
+            let color = Color32::from_rgb(peer.color[0], peer.color[1], peer.color[2]);
+            painter.line_segment([pos2(x, y0), pos2(x, y1)], Stroke::new(2.0, color));
+            let galley = painter.layout_no_wrap(peer.name.clone(), egui::FontId::proportional(10.5), Color32::WHITE);
+            let size = galley.size() + egui::vec2(6.0, 2.0);
+            let tag = Rect::from_min_size(pos2(x - 1.0, y0 - size.y), size);
+            painter.rect_filled(tag, 2.0, color);
+            painter.galley(tag.min + egui::vec2(3.0, 1.0), galley, Color32::WHITE);
+        }
         crate::objects::paint(app, &painter, &t, &layout, &rects, geo.scale);
         crate::dialogs_smart_art::frame_button(app, ui.ctx(), &layout, &rects, geo.scale, ui.clip_rect());
         crate::ink::paint(app, &painter, &rects, &layout, geo.scale);

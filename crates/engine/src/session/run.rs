@@ -65,12 +65,25 @@ impl Session {
     /// control channel). Mutating commands are undoable; a failed command leaves the document as
     /// it was; a panic inside a command becomes an error.
     pub fn run(&mut self, id: &str, params: &Value) -> Result<Value, CmdError> {
-        if self.md_source.is_some()
-            && let Some(mutates) = self.registry.get(id).map(|spec| spec.mutates)
-        {
-            crate::cmd::md_source::before_command(self, id, mutates)?;
+        // Verto: in a shared document, Undo and Redo take back this person's own changes.
+        if self.collab.is_some() && self.collab_depth == 0 && matches!(id, "edit.undo" | "edit.redo") {
+            return self.collab_undo(id == "edit.redo");
         }
-        self.run_command(id, params)
+        self.collab_depth += 1;
+        let r = (|| {
+            if self.md_source.is_some()
+                && let Some(mutates) = self.registry.get(id).map(|spec| spec.mutates)
+            {
+                crate::cmd::md_source::before_command(self, id, mutates)?;
+            }
+            self.run_command(id, params)
+        })();
+        self.collab_depth -= 1;
+        // Verto: what a top-level command changed goes to the shared document.
+        if self.collab_depth == 0 && self.collab.is_some() {
+            self.collab_capture();
+        }
+        r
     }
 
     /// Dispatches `id` through the command registry with transactional rollback on failure,

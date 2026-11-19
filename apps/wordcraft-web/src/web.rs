@@ -16,6 +16,7 @@ const RECIPIENT_EXTS: &[&str] = wordcraft_engine::cmd::mailings::RECIPIENT_EXTEN
 mod dictionaries;
 mod font_store;
 mod served_fonts;
+mod collab;
 const CANVAS_ID: &str = "wordcraft_canvas";
 const LOADING_ID: &str = "wordcraft_loading";
 
@@ -123,7 +124,9 @@ pub fn start() {
                         app.session.read_only = query_param("readonly").is_some_and(|v| v == "1");
                         app.ui.show_discord = false;
                     }
-                    Ok(Box::new(WebShell { app, inbox, messages, prefs }))
+                    // Verto: co-editing messages, in host mode only.
+                    let collab = app_bridge.as_ref().and_then(|_| collab::Link::install(cc.egui_ctx.clone()));
+                    Ok(Box::new(WebShell { app, inbox, messages, prefs, collab }))
                 }),
             )
             .await;
@@ -169,6 +172,8 @@ struct WebShell {
     app: WordApp,
     inbox: Inbox,
     messages: Rc<RefCell<Vec<String>>>,
+    /// Verto: co-editing with the others, through the host page.
+    collab: Option<collab::Link>,
     prefs: crate::prefs::PrefsSync,
 }
 
@@ -191,6 +196,10 @@ impl eframe::App for WebShell {
             self.app.status(msg);
         }
         self.app.logic(ctx);
+        // Verto: the others' changes in, this person's changes and caret out.
+        if let Some(link) = &self.collab {
+            link.process(&mut self.app);
+        }
         // Store changed preferences straight away: a reload or closed tab runs no exit code (#2132).
         if let Some(json) = self.prefs.changed(&self.app) {
             match local_storage() {

@@ -90,6 +90,13 @@ pub struct Session {
     /// Verto: this person may only read the document (`?readonly=1`). Commands that change it are
     /// refused; reading, selecting, copying and finding still work. Not saved with the document.
     pub read_only: bool,
+    /// Verto: the shared document, while several people edit this one at once (`crate::collab`).
+    pub collab: Option<Box<crate::collab::Collab>>,
+    /// Verto: the others editing the shared document, for drawing their carets.
+    pub collab_peers: Vec<crate::collab::Peer>,
+    /// Verto: how deep the running command is (only top-level commands are written to the
+    /// shared document).
+    collab_depth: u32,
     /// Initials for comments (File › Options › General); empty = the name's initials.
     pub initials: String,
     /// Format painter: copied formatting waiting to be applied (and whether it stays on).
