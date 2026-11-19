@@ -87,7 +87,11 @@ pub fn start() {
                     // Pasted pictures wait apart from dropped files: the app inserts one only when the page is the edit target (#1349).
                     app.services.pasted = Some(pasted);
                     app.autosave = false;
-                    app.tell_about_font_downloads();
+                    // Verto: inside the page that keeps the documents, no "Get the Missing Fonts" box
+                    // (the site serves the fonts its documents use; the rest can't be added there).
+                    if app_bridge.is_none() {
+                        app.tell_about_font_downloads();
+                    }
                     // Preferences from an earlier visit (#2132), as the desktop app reads `ui.json`.
                     let stored = stored_prefs();
                     crate::prefs::restore(&mut app, stored.as_deref());
@@ -117,6 +121,7 @@ pub fn start() {
                         app.services.share = Some(Box::new(|| post_to_page("wordcraft:share-request")));
                         app.services.close_document = Some(Box::new(|| post_to_page("wordcraft:close-request")));
                         app.session.read_only = query_param("readonly").is_some_and(|v| v == "1");
+                        app.ui.show_discord = false;
                     }
                     Ok(Box::new(WebShell { app, inbox, messages, prefs }))
                 }),
