@@ -6,20 +6,27 @@
 //! through [`Session::collab_receive`], which rebuilds just the blocks they touched.
 //!
 //! What the mirror keeps (Loro root containers):
-//! - `body`: the top-level blocks' ids, in order (a movable list).
+//! - Block lists, each a movable list of block ids: `body` (the document), `s:{n}` (part `n`:
+//!   a header, footer, note, comment's text or text box) and `l:{id}` (a table cell).
 //! - `t:{id}`: a paragraph's text, merged character by character, with its runs' formatting as a
 //!   mark (`f`, the run's `CharProps` as JSON) that sticks to the text it formats.
 //! - `p:{id}`: `k` (`p` paragraph, `t` table), and `p` (the paragraph's own properties, mark,
-//!   section and inline objects, as JSON) or `j` (a table, whole, as JSON: two people editing the
-//!   same table at once keep the last change).
+//!   section and inline objects, as JSON) or `j` (a table's structure as JSON: its rows and cells
+//!   with their properties, each cell naming its block list instead of holding its blocks). Text
+//!   in cells merges like any other; two people changing a table's structure at once (adding a
+//!   row, merging cells) keep the last change.
+//! - `parts`: each part's kind and settings (its blocks are in `s:{n}`).
 //! - `meta`: the document's settings, styles, numbering, section… one JSON per field.
-//! - `parts` (headers, footers, notes…), `comments`, `media` and `pass`: one entry each.
+//! - `comments`, `media` and `pass`: one entry each.
+//!
+//! Block ids are unique in the whole document, so a caret is told to the others as the id of its
+//! paragraph (in the body, a cell, a header…) and a character offset.
 //!
 //! Undo and Redo in a shared document undo this person's own changes ([`UndoManager`]), adjusted
 //! to what the others did since. The caret stays where it was in the text when others edit
 //! (Loro cursors).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
 use loro::cursor::{Cursor, Side};
@@ -29,12 +36,12 @@ use loro::{
     UndoManager, ValueOrContainer, VersionVector,
 };
 use serde_json::{Value as Json, json};
-use wordcraft_doc::{Block, Document, Paragraph, Path, Pos, StoryRef};
+use wordcraft_doc::{Block, Cell, Document, Paragraph, Part, Path, Pos, Row, StoryRef, Table, para_block};
 
 use crate::{CmdError, Session};
 
 /// The shared document's format: a document shared by another format starts over from the file.
-pub const FORMAT: i64 = 1;
+pub const FORMAT: i64 = 2;
 
 const BODY: &str = "body";
 const META: &str = "meta";
@@ -77,8 +84,8 @@ pub struct Peer {
     pub id: String,
     pub name: String,
     pub color: [u8; 3],
-    /// The id of the top-level block their caret is in, and where in it (characters), as their
-    /// presence says: [`Session::collab_peer_pos`] finds it here.
+    /// The id of the paragraph their caret is in (in the body, a table cell, a header…), and where
+    /// in it (characters), as their presence says: [`Session::collab_peer_pos`] finds it here.
     pub block: String,
     pub off: usize,
 }
@@ -86,17 +93,48 @@ pub struct Peer {
 /// Where a caret was, kept across someone else's changes.
 #[derive(Clone, Debug)]
 pub(crate) struct Anchor {
+    story: StoryRef,
+    /// The paragraph's id, and the id of the top-level block it is in.
     id: String,
+    top: String,
     index: usize,
-    rest: Vec<u32>,
     off: usize,
     cursor: Option<Cursor>,
 }
 
+/// A block's place in the mirror: its id and, for a table, each cell's block list.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Node {
+    /// Empty for a paragraph the mirror doesn't have (one added here so a story or cell doesn't
+    /// end empty or on a table): the next capture puts it in.
+    id: String,
+    cells: Vec<Vec<CellNode>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CellNode {
+    /// The id of the cell's block list (`l:{list}`).
+    list: String,
+    blocks: Vec<Node>,
+}
+
+/// What a block list must hold when read back, as [`Document::ensure_nonempty`] wants it.
+#[derive(Clone, Copy)]
+enum Fix {
+    /// A paragraph somewhere, and not ending on a table.
+    Story,
+    /// Something, and not ending on a table.
+    Cell,
+    /// Something.
+    Part,
+}
+
 pub struct Collab {
     doc: LoroDoc,
-    /// The top-level blocks' ids, in the document's order.
-    ids: Vec<String>,
+    /// The body's blocks, in the document's order.
+    body: Vec<Node>,
+    /// Each part's blocks.
+    parts: BTreeMap<u32, Vec<Node>>,
     /// The document the mirror matches.
     base: Document,
     /// The session revision last captured: an unchanged revision is an unchanged document.
@@ -109,7 +147,7 @@ pub struct Collab {
 
 impl std::fmt::Debug for Collab {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Collab").field("peer", &self.doc.peer_id()).field("blocks", &self.ids.len()).finish()
+        f.debug_struct("Collab").field("peer", &self.doc.peer_id()).field("blocks", &self.body.len()).field("parts", &self.parts.len()).finish()
     }
 }
 
@@ -133,6 +171,14 @@ fn text_of(doc: &LoroDoc, id: &str) -> LoroText {
 
 fn block_map(doc: &LoroDoc, id: &str) -> LoroMap {
     doc.get_map(format!("p:{id}").as_str())
+}
+
+fn cell_list(id: &str) -> String {
+    format!("l:{id}")
+}
+
+fn story_list(k: u32) -> String {
+    format!("s:{k}")
 }
 
 fn as_string(v: &ValueOrContainer) -> Option<String> {
@@ -166,6 +212,14 @@ fn movable_strings(list: &LoroMovableList) -> Vec<String> {
     list.to_vec().into_iter().filter_map(|v| if let LoroValue::String(s) = v { Some(s.as_str().to_owned()) } else { None }).collect()
 }
 
+fn clear(list: &LoroMovableList) -> R<()> {
+    let n = list.len();
+    if n > 0 {
+        list.delete(0, n).map_err(err)?;
+    }
+    Ok(())
+}
+
 fn to_json<T: serde::Serialize>(v: &T) -> R<String> {
     serde_json::to_string(v).map_err(err)
 }
@@ -176,6 +230,46 @@ fn shell_of(p: &Paragraph) -> R<String> {
     if let Some(o) = v.as_object_mut() {
         o.remove("text");
         o.remove("runs");
+    }
+    serde_json::to_string(&v).map_err(err)
+}
+
+/// A table's structure as JSON: each cell names its block list (`list`) instead of its blocks.
+fn table_shell(t: &Table, cells: &[Vec<CellNode>]) -> R<String> {
+    let bare = Table {
+        props: t.props.clone(),
+        grid: t.grid.clone(),
+        controls: t.controls.clone(),
+        rows: t
+            .rows
+            .iter()
+            .map(|r| Row {
+                props: r.props.clone(),
+                controls: r.controls.clone(),
+                cells: r.cells.iter().map(|c| Cell { props: c.props.clone(), blocks: Vec::new(), controls: c.controls.clone() }).collect(),
+            })
+            .collect(),
+    };
+    let mut v = serde_json::to_value(&bare).map_err(err)?;
+    if let Some(rows) = v.get_mut("rows").and_then(Json::as_array_mut) {
+        for (row, rn) in rows.iter_mut().zip(cells) {
+            let Some(cs) = row.get_mut("cells").and_then(Json::as_array_mut) else { continue };
+            for (cell, cn) in cs.iter_mut().zip(rn) {
+                if let Some(o) = cell.as_object_mut() {
+                    o.remove("blocks");
+                    o.insert("list".into(), Json::String(cn.list.clone()));
+                }
+            }
+        }
+    }
+    serde_json::to_string(&v).map_err(err)
+}
+
+/// A part's kind and settings as JSON: no blocks.
+fn part_shell(p: &Part) -> R<String> {
+    let mut v = serde_json::to_value(Part { kind: p.kind, blocks: Vec::new(), body: p.body }).map_err(err)?;
+    if let Some(o) = v.as_object_mut() {
+        o.remove("blocks");
     }
     serde_json::to_string(&v).map_err(err)
 }
@@ -271,15 +365,16 @@ fn fix_objects(p: &mut Paragraph) {
     p.text = text;
 }
 
-/// The block `id` as the mirror has it.
-fn block_from(doc: &LoroDoc, id: &str) -> Option<Arc<Block>> {
-    match get_str(&block_map(doc, id), "k").as_deref() {
-        Some("t") => {
-            let j = get_str(&block_map(doc, id), "j")?;
-            serde_json::from_str::<Block>(&j).ok().map(Arc::new)
-        }
-        _ => para_from(doc, id).map(|p| Arc::new(Block::Para(p))),
-    }
+fn blocks_same(a: &[Arc<Block>], b: &[Arc<Block>]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| Arc::ptr_eq(x, y))
+}
+
+fn cells_same(a: &Cell, b: &Cell) -> bool {
+    a.props == b.props && a.controls == b.controls && blocks_same(&a.blocks, &b.blocks)
+}
+
+fn rows_same(a: &Row, b: &Row) -> bool {
+    a.props == b.props && a.controls == b.controls && a.cells.len() == b.cells.len() && a.cells.iter().zip(&b.cells).all(|(x, y)| cells_same(x, y))
 }
 
 /// How alike two blocks are, for pairing an edited block with what it became: shared text at the
@@ -296,18 +391,27 @@ fn likeness(a: &Block, b: &Block) -> usize {
     }
 }
 
-/// Pairs the old blocks with the new ones in order, best likeness first (`None`: deleted or
-/// inserted). Small regions are aligned exactly; large ones position by position.
-fn pair(old: &[Arc<Block>], new: &[Arc<Block>]) -> Vec<(Option<usize>, Option<usize>)> {
-    let (m, n) = (old.len(), new.len());
-    if m * n > 40_000 {
+fn row_likeness(a: &Row, b: &Row) -> usize {
+    1 + a.cells.iter().zip(&b.cells).filter(|(x, y)| blocks_same(&x.blocks, &y.blocks)).count()
+}
+
+fn cell_likeness(a: &Cell, b: &Cell) -> usize {
+    1 + a.blocks.iter().zip(&b.blocks).filter(|(x, y)| Arc::ptr_eq(x, y)).count()
+}
+
+/// Pairs `m` old items with `n` new ones in order, best total likeness first (`None`: deleted or
+/// inserted; a likeness of 0 never pairs). Small regions are aligned exactly; large ones position
+/// by position.
+fn pair_by(m: usize, n: usize, like: impl Fn(usize, usize) -> usize) -> Vec<(Option<usize>, Option<usize>)> {
+    if m.saturating_mul(n) > 40_000 {
         return (0..m.max(n)).map(|i| ((i < m).then_some(i), (i < n).then_some(i))).collect();
     }
+    let likes: Vec<Vec<usize>> = (0..m).map(|i| (0..n).map(|j| like(i, j)).collect()).collect();
     // score[i][j]: best total likeness of old[i..] with new[j..].
     let mut score = vec![vec![0usize; n + 1]; m + 1];
     for i in (0..m).rev() {
         for j in (0..n).rev() {
-            let l = likeness(&old[i], &new[j]);
+            let l = likes[i][j];
             let take = if l > 0 { l + score[i + 1][j + 1] } else { 0 };
             score[i][j] = take.max(score[i + 1][j]).max(score[i][j + 1]);
         }
@@ -316,7 +420,7 @@ fn pair(old: &[Arc<Block>], new: &[Arc<Block>]) -> Vec<(Option<usize>, Option<us
     let (mut i, mut j) = (0, 0);
     while i < m || j < n {
         if i < m && j < n {
-            let l = likeness(&old[i], &new[j]);
+            let l = likes[i][j];
             if l > 0 && score[i][j] == l + score[i + 1][j + 1] {
                 out.push((Some(i), Some(j)));
                 i += 1;
@@ -341,10 +445,61 @@ fn pair(old: &[Arc<Block>], new: &[Arc<Block>]) -> Vec<(Option<usize>, Option<us
     out
 }
 
+/// [`pair_by`] after the unchanged start and end (`same`), which pair as they are.
+fn align(m: usize, n: usize, same: impl Fn(usize, usize) -> bool, like: impl Fn(usize, usize) -> usize) -> Vec<(Option<usize>, Option<usize>)> {
+    let pre = (0..m.min(n)).take_while(|&i| same(i, i)).count();
+    let suf = (0..(m - pre).min(n - pre)).take_while(|&k| same(m - 1 - k, n - 1 - k)).count();
+    let mut out: Vec<(Option<usize>, Option<usize>)> = (0..pre).map(|i| (Some(i), Some(i))).collect();
+    for (a, b) in pair_by(m - pre - suf, n - pre - suf, |i, j| like(pre + i, pre + j)) {
+        out.push((a.map(|x| x + pre), b.map(|x| x + pre)));
+    }
+    out.extend((0..suf).map(|k| (Some(m - suf + k), Some(n - suf + k))));
+    out
+}
+
+/// Whether someone else's update touched `n` or anything inside it.
+fn touched(n: &Node, c: &Changes) -> bool {
+    c.blocks.contains(&n.id) || n.cells.iter().flatten().any(|cn| c.cells.contains(&cn.list) || cn.blocks.iter().any(|b| touched(b, c)))
+}
+
+/// The node at `path` (`[block]`, or `[block, row, cell, block…]` inside tables).
+fn node_at<'a>(nodes: &'a [Node], path: &[u32]) -> Option<&'a Node> {
+    let (first, rest) = path.split_first()?;
+    let n = nodes.get(*first as usize)?;
+    match rest {
+        [] => Some(n),
+        [r, c, more @ ..] => node_at(&n.cells.get(*r as usize)?.get(*c as usize)?.blocks, more),
+        _ => None,
+    }
+}
+
+/// Fills `path` with where the block `id` is among `nodes`.
+fn path_of(nodes: &[Node], id: &str, path: &mut Vec<u32>) -> bool {
+    for (i, n) in nodes.iter().enumerate() {
+        path.push(i as u32);
+        if n.id == id {
+            return true;
+        }
+        for (r, row) in n.cells.iter().enumerate() {
+            for (ci, cell) in row.iter().enumerate() {
+                path.push(r as u32);
+                path.push(ci as u32);
+                if path_of(&cell.blocks, id, path) {
+                    return true;
+                }
+                path.pop();
+                path.pop();
+            }
+        }
+        path.pop();
+    }
+    false
+}
+
 impl Collab {
     fn empty(doc: LoroDoc, base: Document) -> Collab {
         let undo = new_undo(&doc);
-        Collab { sent: doc.oplog_vv(), doc, ids: Vec::new(), base, seen_rev: None, outbox: Vec::new(), next_id: 0, undo }
+        Collab { sent: doc.oplog_vv(), doc, body: Vec::new(), parts: BTreeMap::new(), base, seen_rev: None, outbox: Vec::new(), next_id: 0, undo }
     }
 
     /// Starts a shared document from `doc`: the first person to open the file.
@@ -352,12 +507,7 @@ impl Collab {
         let mut c = Collab::empty(new_doc(), Document::default());
         c.doc.get_map("format").insert("version", FORMAT).map_err(err)?;
         let list = c.doc.get_movable_list(BODY);
-        for (i, b) in doc.body.iter().enumerate() {
-            let id = format!("b{i}");
-            list.push(id.as_str()).map_err(err)?;
-            c.write_block(&id, b)?;
-            c.ids.push(id);
-        }
+        c.body = c.sync_list(&list, Vec::new(), &[], &doc.body)?;
         c.write_doc_fields(None, doc)?;
         c.doc.commit();
         c.sent = c.doc.oplog_vv();
@@ -382,11 +532,7 @@ impl Collab {
             )));
         }
         let mut c = Collab::empty(doc, local.clone());
-        c.ids = movable_strings(&c.doc.get_movable_list(BODY));
-        let all: BTreeSet<String> = c.ids.iter().cloned().collect();
-        let keys = |name: &str| -> BTreeSet<String> { c.doc.get_map(name).keys().map(|k| k.to_string()).collect() };
-        let changes = Changes { body: true, blocks: all, meta: keys(META), parts: keys(PARTS), comments: keys(COMMENTS), media: keys(MEDIA), pass: keys(PASS) };
-        let out = c.rebuild(&changes, true)?;
+        let out = c.rebuild(&Changes { all: true, ..Changes::default() })?;
         c.base = out.clone();
         Ok((c, out))
     }
@@ -420,20 +566,131 @@ impl Collab {
         format!("{:x}.{}", self.doc.peer_id(), self.next_id)
     }
 
-    /// Writes a block under `id` (its text merged into what the mirror has).
-    fn write_block(&self, id: &str, b: &Block) -> R<()> {
-        let m = block_map(&self.doc, id);
-        match b {
+    /// Brings the block list `list` (whose blocks were `old`, placed as `nodes`) to `new`: the
+    /// blocks that changed are written, the new ones added, the gone ones removed. The new nodes.
+    fn sync_list(&mut self, list: &LoroMovableList, nodes: Vec<Node>, old: &[Arc<Block>], new: &[Arc<Block>]) -> R<Vec<Node>> {
+        if nodes.len() != old.len() {
+            // Out of step (it shouldn't happen): the list is written again.
+            log::warn!("co-editing: a block list was out of step; written again");
+            clear(list)?;
+            let mut out = Vec::with_capacity(new.len());
+            for (i, b) in new.iter().enumerate() {
+                out.push(self.insert_block(list, i, b)?);
+            }
+            return Ok(out);
+        }
+        if blocks_same(old, new) {
+            return Ok(nodes);
+        }
+        let pairs = align(old.len(), new.len(), |i, j| Arc::ptr_eq(&old[i], &new[j]), |i, j| likeness(&old[i], &new[j]));
+        let mut slots: Vec<Option<Node>> = nodes.into_iter().map(Some).collect();
+        let mut out = Vec::with_capacity(new.len());
+        // Where the next block is in the mirror's list (blocks it doesn't have take no place).
+        let mut at = 0usize;
+        for (o, n) in pairs {
+            match (o, n) {
+                (Some(oi), Some(ni)) => {
+                    let node = slots[oi].take().unwrap_or_default();
+                    if node.id.is_empty() {
+                        out.push(self.insert_block(list, at, &new[ni])?);
+                    } else if Arc::ptr_eq(&old[oi], &new[ni]) {
+                        out.push(node);
+                    } else {
+                        out.push(self.write_block(node, Some(&old[oi]), &new[ni])?);
+                    }
+                    at += 1;
+                }
+                (Some(oi), None) => {
+                    if slots[oi].as_ref().is_some_and(|n| !n.id.is_empty()) {
+                        list.delete(at, 1).map_err(err)?;
+                    }
+                }
+                (None, Some(ni)) => {
+                    out.push(self.insert_block(list, at, &new[ni])?);
+                    at += 1;
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(out)
+    }
+
+    /// Adds `b` to `list` at `at`, under a new id.
+    fn insert_block(&mut self, list: &LoroMovableList, at: usize, b: &Block) -> R<Node> {
+        let id = self.new_id();
+        list.insert(at, id.as_str()).map_err(err)?;
+        self.write_block(Node { id, cells: Vec::new() }, None, b)
+    }
+
+    /// Writes the block `node` now holds (`new`; it held `old`): a paragraph's text merged into
+    /// what the mirror has, a table's cells each in their own list.
+    fn write_block(&mut self, node: Node, old: Option<&Block>, new: &Block) -> R<Node> {
+        let m = block_map(&self.doc, &node.id);
+        match new {
             Block::Para(p) => {
                 put(&m, "k", Some("p".into()))?;
                 put(&m, "p", Some(shell_of(p)?))?;
-                self.write_text(id, p)
+                self.write_text(&node.id, p)?;
+                Ok(Node { id: node.id, cells: Vec::new() })
             }
-            Block::Table(_) => {
+            Block::Table(t) => {
                 put(&m, "k", Some("t".into()))?;
-                put(&m, "j", Some(to_json(b)?))
+                let cells = self.write_cells(node.cells, old.and_then(Block::as_table), t)?;
+                put(&m, "j", Some(table_shell(t, &cells)?))?;
+                Ok(Node { id: node.id, cells })
             }
         }
+    }
+
+    /// A table's cells: each row paired with what it was, each cell's blocks synced in its list.
+    fn write_cells(&mut self, nodes: Vec<Vec<CellNode>>, old: Option<&Table>, new: &Table) -> R<Vec<Vec<CellNode>>> {
+        let (orows, nodes): (&[Row], Vec<Vec<CellNode>>) = match old {
+            Some(t) if t.rows.len() == nodes.len() && t.rows.iter().zip(&nodes).all(|(r, n)| r.cells.len() == n.len()) => (&t.rows[..], nodes),
+            _ => (&[], Vec::new()),
+        };
+        let pairs = align(orows.len(), new.rows.len(), |i, j| rows_same(&orows[i], &new.rows[j]), |i, j| row_likeness(&orows[i], &new.rows[j]));
+        let mut slots: Vec<Option<Vec<CellNode>>> = nodes.into_iter().map(Some).collect();
+        let mut out = Vec::with_capacity(new.rows.len());
+        for (o, n) in pairs {
+            let Some(ni) = n else { continue };
+            let row = &new.rows[ni];
+            match o {
+                Some(oi) => {
+                    let rn = slots[oi].take().unwrap_or_default();
+                    if rows_same(&orows[oi], row) {
+                        out.push(rn);
+                    } else {
+                        out.push(self.write_row(rn, Some(&orows[oi]), row)?);
+                    }
+                }
+                None => out.push(self.write_row(Vec::new(), None, row)?),
+            }
+        }
+        Ok(out)
+    }
+
+    fn write_row(&mut self, nodes: Vec<CellNode>, old: Option<&Row>, new: &Row) -> R<Vec<CellNode>> {
+        let none: &[Arc<Block>] = &[];
+        let (ocells, nodes): (&[Cell], Vec<CellNode>) = match old {
+            Some(r) if r.cells.len() == nodes.len() => (&r.cells[..], nodes),
+            _ => (&[], Vec::new()),
+        };
+        let pairs = align(ocells.len(), new.cells.len(), |i, j| cells_same(&ocells[i], &new.cells[j]), |i, j| cell_likeness(&ocells[i], &new.cells[j]));
+        let mut slots: Vec<Option<CellNode>> = nodes.into_iter().map(Some).collect();
+        let mut out = Vec::with_capacity(new.cells.len());
+        for (o, n) in pairs {
+            let Some(ni) = n else { continue };
+            let (cn, old_blocks) = match o {
+                Some(oi) => (slots[oi].take().unwrap_or_default(), &ocells[oi].blocks[..]),
+                None => (CellNode::default(), none),
+            };
+            // A cell new to the mirror gets a list of its own.
+            let (list_id, nodes, old_blocks) = if cn.list.is_empty() { (self.new_id(), Vec::new(), none) } else { (cn.list, cn.blocks, old_blocks) };
+            let list = self.doc.get_movable_list(cell_list(&list_id).as_str());
+            let blocks = self.sync_list(&list, nodes, old_blocks, &new.cells[ni].blocks)?;
+            out.push(CellNode { list: list_id, blocks });
+        }
+        Ok(out)
     }
 
     /// Brings the mirror's text of `id` to the paragraph's: the changed middle is replaced, then
@@ -503,7 +760,7 @@ impl Collab {
 
     /// The document fields, parts, comments and media that differ from `before` (all of them
     /// without one).
-    fn write_doc_fields(&self, before: Option<&Document>, after: &Document) -> R<()> {
+    fn write_doc_fields(&mut self, before: Option<&Document>, after: &Document) -> R<()> {
         let meta = self.doc.get_map(META);
         macro_rules! put_field {
             ($f:ident, $k:literal) => {
@@ -513,12 +770,39 @@ impl Collab {
             };
         }
         meta_fields!(put_field);
+        let none: &[Arc<Block>] = &[];
         let parts = self.doc.get_map(PARTS);
         let keys: BTreeSet<u32> = after.parts.keys().chain(before.map(|b| b.parts.keys()).into_iter().flatten()).copied().collect();
         for k in keys {
             let (old, new) = (before.and_then(|b| b.parts.get(&k)), after.parts.get(&k));
-            if before.is_none() || old != new {
-                put(&parts, &k.to_string(), new.map(to_json).transpose()?)?;
+            let same = match (old, new) {
+                (Some(a), Some(b)) => a.kind == b.kind && a.body == b.body && blocks_same(&a.blocks, &b.blocks),
+                (None, None) => true,
+                _ => false,
+            };
+            if before.is_some() && same {
+                continue;
+            }
+            let list = self.doc.get_movable_list(story_list(k).as_str());
+            match new {
+                Some(p) => {
+                    put(&parts, &k.to_string(), Some(part_shell(p)?))?;
+                    let (nodes, old_blocks) = match (self.parts.remove(&k), old) {
+                        (Some(n), Some(o)) => (n, &o.blocks[..]),
+                        // A part new here: whatever an earlier part of that number left goes.
+                        _ => {
+                            clear(&list)?;
+                            (Vec::new(), none)
+                        }
+                    };
+                    let nodes = self.sync_list(&list, nodes, old_blocks, &p.blocks)?;
+                    self.parts.insert(k, nodes);
+                }
+                None => {
+                    put(&parts, &k.to_string(), None)?;
+                    clear(&list)?;
+                    self.parts.remove(&k);
+                }
             }
         }
         let comments = self.doc.get_map(COMMENTS);
@@ -562,48 +846,18 @@ impl Collab {
             return Ok(());
         }
         self.seen_rev = Some(rev);
-        let old = self.base.body.clone();
-        let new = &after.body;
-        let same = old.len() == new.len() && old.iter().zip(new).all(|(a, b)| Arc::ptr_eq(a, b));
-        if !same {
-            let pre = old.iter().zip(new).take_while(|(a, b)| Arc::ptr_eq(a, b)).count();
-            let suf = old[pre..].iter().rev().zip(new[pre..].iter().rev()).take_while(|(a, b)| Arc::ptr_eq(a, b)).count();
-            let (om, nm) = (&old[pre..old.len() - suf], &new[pre..new.len() - suf]);
-            let list = self.doc.get_movable_list(BODY);
-            let mut ids: Vec<String> = self.ids[..pre].to_vec();
-            let mut at = pre;
-            for (o, n) in pair(om, nm) {
-                match (o, n) {
-                    (Some(oi), Some(ni)) => {
-                        let id = self.ids[pre + oi].clone();
-                        if !Arc::ptr_eq(&om[oi], &nm[ni]) && *om[oi] != *nm[ni] {
-                            self.write_block(&id, &nm[ni])?;
-                        }
-                        ids.push(id);
-                        at += 1;
-                    }
-                    (Some(_), None) => {
-                        list.delete(at, 1).map_err(err)?;
-                    }
-                    (None, Some(ni)) => {
-                        let id = self.new_id();
-                        list.insert(at, id.as_str()).map_err(err)?;
-                        self.write_block(&id, &nm[ni])?;
-                        ids.push(id);
-                        at += 1;
-                    }
-                    (None, None) => {}
-                }
-            }
-            ids.extend(self.ids[old.len() - suf..].iter().cloned());
-            self.ids = ids;
-        }
-        self.write_doc_fields(Some(&self.base.clone()), after)?;
+        let base = std::mem::take(&mut self.base);
+        let nodes = std::mem::take(&mut self.body);
+        let list = self.doc.get_movable_list(BODY);
+        let done = self.sync_list(&list, nodes, &base.body, &after.body).and_then(|body| {
+            self.body = body;
+            self.write_doc_fields(Some(&base), after)
+        });
         // Committed now (one undo step per command); exported for the others with the next
         // `take_outbox`.
         self.doc.commit();
         self.base = after.clone();
-        Ok(())
+        done
     }
 
     /// Takes in an update from someone else: the document with their changes, or `None` when it
@@ -667,40 +921,156 @@ impl Collab {
                 _ => {
                     if let Some(id) = name.strip_prefix("t:").or_else(|| name.strip_prefix("p:")) {
                         c.blocks.insert(id.to_string());
+                    } else if let Some(id) = name.strip_prefix("l:") {
+                        c.cells.insert(id.to_string());
+                    } else if let Some(k) = name.strip_prefix("s:").and_then(|k| k.parse::<u32>().ok()) {
+                        c.stories.insert(k);
                     }
                 }
             }
         }
-        let out = self.rebuild(&c, false)?;
+        let out = self.rebuild(&c)?;
         self.base = out.clone();
         self.seen_rev = None;
         Ok(Some(out))
     }
 
-    /// The document the mirror matches now, from `base` and what changed.
-    fn rebuild(&mut self, c: &Changes, all: bool) -> R<Document> {
-        let mut out = self.base.clone();
-        let known: HashMap<String, Arc<Block>> = self.ids.iter().cloned().zip(self.base.body.iter().cloned()).collect();
-        if c.body {
-            self.ids = movable_strings(&self.doc.get_movable_list(BODY));
+    /// The blocks of the list `name` as the mirror has them; `old` (the blocks and their nodes)
+    /// are kept where nothing in them changed.
+    fn read_list(&self, name: &str, old: Option<(&[Arc<Block>], &[Node])>, c: &Changes, fix: Fix) -> (Vec<Arc<Block>>, Vec<Node>) {
+        let ids = movable_strings(&self.doc.get_movable_list(name));
+        let known: HashMap<&str, (&Arc<Block>, &Node)> =
+            old.map(|(b, n)| b.iter().zip(n).filter(|(_, n)| !n.id.is_empty()).map(|(b, n)| (n.id.as_str(), (b, n))).collect()).unwrap_or_default();
+        let mut blocks = Vec::with_capacity(ids.len() + 1);
+        let mut nodes = Vec::with_capacity(ids.len() + 1);
+        for id in &ids {
+            if let Some((b, n)) = self.read_block(id, known.get(id.as_str()).copied(), c) {
+                blocks.push(b);
+                nodes.push(n);
+            }
         }
-        if c.body || !c.blocks.is_empty() || all {
-            let mut body = Vec::with_capacity(self.ids.len());
-            let mut ids = Vec::with_capacity(self.ids.len());
-            for id in &self.ids {
-                let block = if all || c.blocks.contains(id) || !known.contains_key(id) { block_from(&self.doc, id) } else { known.get(id).cloned() };
-                if let Some(b) = block {
-                    body.push(b);
-                    ids.push(id.clone());
+        let ends_on_table = matches!(blocks.last().map(|b| &**b), Some(Block::Table(_)));
+        let needs = match fix {
+            Fix::Story => ends_on_table || !blocks.iter().any(|b| matches!(**b, Block::Para(_))),
+            Fix::Cell => ends_on_table || blocks.is_empty(),
+            Fix::Part => blocks.is_empty(),
+        };
+        if needs {
+            blocks.push(para_block(Paragraph::new()));
+            nodes.push(Node::default());
+        }
+        (blocks, nodes)
+    }
+
+    /// The block `id` as the mirror has it (`old`, as it was, when nothing in it changed).
+    fn read_block(&self, id: &str, old: Option<(&Arc<Block>, &Node)>, c: &Changes) -> Option<(Arc<Block>, Node)> {
+        if let Some((b, n)) = old
+            && !c.all
+            && !touched(n, c)
+        {
+            return Some((b.clone(), n.clone()));
+        }
+        let m = block_map(&self.doc, id);
+        match get_str(&m, "k").as_deref() {
+            Some("t") => {
+                let old_t = old.and_then(|(b, n)| b.as_table().map(|t| (t, n)));
+                let (t, cells) = self.read_table(&m, old_t, c)?;
+                Some((Arc::new(Block::Table(t)), Node { id: id.to_string(), cells }))
+            }
+            _ => para_from(&self.doc, id).map(|p| (Arc::new(Block::Para(p)), Node { id: id.to_string(), cells: Vec::new() })),
+        }
+    }
+
+    fn read_table(&self, m: &LoroMap, old: Option<(&Table, &Node)>, c: &Changes) -> Option<(Table, Vec<Vec<CellNode>>)> {
+        let mut v: Json = serde_json::from_str(&get_str(m, "j")?).ok()?;
+        let mut lists: Vec<Vec<String>> = Vec::new();
+        if let Some(rows) = v.get_mut("rows").and_then(Json::as_array_mut) {
+            for row in rows {
+                let mut l = Vec::new();
+                if let Some(cells) = row.get_mut("cells").and_then(Json::as_array_mut) {
+                    for cell in cells {
+                        let Some(o) = cell.as_object_mut() else {
+                            l.push(String::new());
+                            continue;
+                        };
+                        l.push(o.remove("list").and_then(|x| x.as_str().map(str::to_owned)).unwrap_or_default());
+                        o.insert("blocks".into(), json!([]));
+                    }
+                }
+                lists.push(l);
+            }
+        }
+        let mut t: Table = serde_json::from_value(v).ok()?;
+        let mut prev: HashMap<&str, (&Cell, &CellNode)> = HashMap::new();
+        if let Some((ot, on)) = old {
+            for (row, rn) in ot.rows.iter().zip(&on.cells) {
+                for (cell, cn) in row.cells.iter().zip(rn) {
+                    if !cn.list.is_empty() {
+                        prev.insert(cn.list.as_str(), (cell, cn));
+                    }
                 }
             }
-            self.ids = ids;
-            out.body = body;
+        }
+        let mut nodes = Vec::with_capacity(t.rows.len());
+        for (r, row) in t.rows.iter_mut().enumerate() {
+            let mut rn = Vec::with_capacity(row.cells.len());
+            for (ci, cell) in row.cells.iter_mut().enumerate() {
+                let list = lists.get(r).and_then(|l| l.get(ci)).cloned().unwrap_or_default();
+                let old = prev.get(list.as_str()).map(|(pc, pn)| (&pc.blocks[..], &pn.blocks[..]));
+                let (blocks, bn) = self.read_list(&cell_list(&list), old, c, Fix::Cell);
+                cell.blocks = blocks;
+                rn.push(CellNode { list, blocks: bn });
+            }
+            nodes.push(rn);
+        }
+        Some((t, nodes))
+    }
+
+    /// The document the mirror matches now, from `base` and what changed.
+    fn rebuild(&mut self, c: &Changes) -> R<Document> {
+        let mut out = self.base.clone();
+        if c.all || c.body || self.body.iter().any(|n| touched(n, c)) {
+            let old = if c.all { None } else { Some((&self.base.body[..], &self.body[..])) };
+            let (blocks, nodes) = self.read_list(BODY, old, c, Fix::Story);
+            out.body = blocks;
+            self.body = nodes;
+        }
+        let parts = self.doc.get_map(PARTS);
+        let mut keys: BTreeSet<u32> = c.parts.iter().filter_map(|k| k.parse().ok()).collect();
+        keys.extend(c.stories.iter().copied());
+        keys.extend(self.parts.iter().filter(|(_, nodes)| nodes.iter().any(|n| touched(n, c))).map(|(k, _)| *k));
+        if c.all {
+            out.parts.clear();
+            self.parts.clear();
+            keys.extend(parts.keys().filter_map(|k| k.to_string().parse::<u32>().ok()));
+        }
+        for k in keys {
+            let shell = get_str(&parts, &k.to_string()).and_then(|s| serde_json::from_str::<Json>(&s).ok()).filter(Json::is_object);
+            let Some(mut v) = shell else {
+                out.parts.remove(&k);
+                self.parts.remove(&k);
+                continue;
+            };
+            let old = match (out.parts.get(&k), self.parts.get(&k)) {
+                (Some(p), Some(n)) => Some((&p.blocks[..], &n[..])),
+                _ => None,
+            };
+            let (blocks, nodes) = self.read_list(&story_list(k), old, c, Fix::Part);
+            v["blocks"] = json!([]);
+            match serde_json::from_value::<Part>(v) {
+                Ok(mut p) => {
+                    p.blocks = blocks;
+                    out.parts.insert(k, p);
+                    self.parts.insert(k, nodes);
+                }
+                Err(e) => log::warn!("co-editing: part {k}: {e}"),
+            }
         }
         let meta = self.doc.get_map(META);
+        let meta_keys: BTreeSet<String> = if c.all { meta.keys().map(|k| k.to_string()).collect() } else { c.meta.clone() };
         macro_rules! get_field {
             ($f:ident, $k:literal) => {
-                if c.meta.contains($k)
+                if meta_keys.contains($k)
                     && let Some(s) = get_str(&meta, $k)
                     && let Ok(v) = serde_json::from_str(&s)
                 {
@@ -709,20 +1079,14 @@ impl Collab {
             };
         }
         meta_fields!(get_field);
-        let parts = self.doc.get_map(PARTS);
-        for k in &c.parts {
-            let Ok(n) = k.parse::<u32>() else { continue };
-            match get_str(&parts, k).and_then(|s| serde_json::from_str(&s).ok()) {
-                Some(p) => {
-                    out.parts.insert(n, p);
-                }
-                None => {
-                    out.parts.remove(&n);
-                }
-            }
-        }
         let comments = self.doc.get_map(COMMENTS);
-        for k in &c.comments {
+        let comment_keys: BTreeSet<String> = if c.all {
+            out.comments.clear();
+            comments.keys().map(|k| k.to_string()).collect()
+        } else {
+            c.comments.clone()
+        };
+        for k in &comment_keys {
             let Ok(n) = k.parse::<u32>() else { continue };
             match get_str(&comments, k).and_then(|s| serde_json::from_str(&s).ok()) {
                 Some(v) => {
@@ -735,7 +1099,13 @@ impl Collab {
         }
         for (name, keys, target) in [(MEDIA, &c.media, &mut out.media), (PASS, &c.pass, &mut out.passthrough)] {
             let map = self.doc.get_map(name);
-            for k in keys {
+            let keys: BTreeSet<String> = if c.all {
+                target.clear();
+                map.keys().map(|k| k.to_string()).collect()
+            } else {
+                keys.clone()
+            };
+            for k in &keys {
                 match map.get(k) {
                     Some(ValueOrContainer::Value(v @ LoroValue::Binary(_))) => {
                         if let Ok(bytes) = Arc::<Vec<u8>>::try_from(v) {
@@ -748,66 +1118,100 @@ impl Collab {
                 }
             }
         }
-        out.ensure_nonempty();
         Ok(out)
     }
 
-    /// Where `p` is, kept across the others' changes (top-level blocks of the body).
-    pub(crate) fn anchor(&self, p: &Pos, doc: &Document) -> Option<Anchor> {
-        if p.story != StoryRef::Body {
+    fn nodes_of(&self, s: StoryRef) -> Option<&[Node]> {
+        match s {
+            StoryRef::Body => Some(&self.body),
+            StoryRef::Part(k) => self.parts.get(&k).map(Vec::as_slice),
+        }
+    }
+
+    /// Where the block `id` is now: its story and path.
+    fn find(&self, id: &str) -> Option<(StoryRef, Vec<u32>)> {
+        if id.is_empty() {
             return None;
         }
+        let mut path = Vec::new();
+        if path_of(&self.body, id, &mut path) {
+            return Some((StoryRef::Body, path));
+        }
+        for (k, nodes) in &self.parts {
+            path.clear();
+            if path_of(nodes, id, &mut path) {
+                return Some((StoryRef::Part(*k), path));
+            }
+        }
+        None
+    }
+
+    /// Where `p` is, kept across the others' changes.
+    pub(crate) fn anchor(&self, p: &Pos, doc: &Document) -> Option<Anchor> {
+        let nodes = self.nodes_of(p.story)?;
         let index = *p.path.0.first()? as usize;
-        let id = self.ids.get(index)?.clone();
-        let cursor = if p.path.0.len() == 1 {
-            let text = doc.body.get(index).and_then(|b| b.as_para()).map(|q| q.text.as_str()).unwrap_or("");
-            text_of(&self.doc, &id).get_cursor(chars_at(text, p.off), Side::Middle)
-        } else {
-            None
+        let top = nodes.get(index)?.id.clone();
+        let node = node_at(nodes, &p.path.0);
+        let cursor = match (node, doc.para_at(p)) {
+            (Some(n), Some(q)) if !n.id.is_empty() && n.cells.is_empty() => text_of(&self.doc, &n.id).get_cursor(chars_at(&q.text, p.off), Side::Middle),
+            _ => None,
         };
-        Some(Anchor { id, index, rest: p.path.0[1..].to_vec(), off: p.off, cursor })
+        Some(Anchor { story: p.story, id: node.map(|n| n.id.clone()).unwrap_or_default(), top, index, off: p.off, cursor })
     }
 
     /// Where an anchor is now in `doc` (the document after the changes).
     pub(crate) fn resolve(&self, a: &Anchor, doc: &Document) -> Pos {
-        let Some(index) = self.ids.iter().position(|i| *i == a.id) else {
-            // Its block is gone: the block that took its place, at the start.
-            let index = a.index.min(doc.body.len().saturating_sub(1));
-            return Pos { story: StoryRef::Body, path: Path(vec![index as u32]), off: 0 };
+        if let Some((story, path)) = self.find(&a.id)
+            && story == a.story
+        {
+            let pos = Pos { story, path: Path(path), off: 0 };
+            let off = match (&a.cursor, doc.para_at(&pos)) {
+                (Some(cur), Some(q)) => self.doc.get_cursor_pos(cur).map(|r| bytes_at(&q.text, r.current.pos)).unwrap_or(a.off.min(q.text.len())),
+                (None, Some(q)) => a.off.min(q.text.len()),
+                _ => 0,
+            };
+            return Pos { off, ..pos };
+        }
+        // Its paragraph is gone: the start of the block it was in, or of the one in its place.
+        let blocks = doc.story(a.story).filter(|b| !b.is_empty());
+        let Some(blocks) = blocks else { return Pos::body(0, 0) };
+        let nodes = self.nodes_of(a.story).unwrap_or(&[]);
+        let index = nodes.iter().position(|n| !a.top.is_empty() && n.id == a.top).unwrap_or(a.index).min(blocks.len() - 1);
+        let path = match blocks.get(index).map(|b| &**b) {
+            Some(Block::Table(_)) => vec![index as u32, 0, 0, 0],
+            _ => vec![index as u32],
         };
-        let mut path = vec![index as u32];
-        path.extend(&a.rest);
-        let off = match (&a.cursor, doc.body.get(index).and_then(|b| b.as_para())) {
-            (Some(cur), Some(q)) => self.doc.get_cursor_pos(cur).map(|r| bytes_at(&q.text, r.current.pos)).unwrap_or(a.off.min(q.text.len())),
-            _ => a.off,
-        };
-        Pos { story: StoryRef::Body, path: Path(path), off }
+        Pos { story: a.story, path: Path(path), off: 0 }
     }
 
-    /// The top-level block id and character offset of `p`, for the others to draw this caret.
+    /// The paragraph id and character offset of `p`, for the others to draw this caret.
     pub(crate) fn presence_of(&self, p: &Pos, doc: &Document) -> Option<(String, usize)> {
-        if p.story != StoryRef::Body {
+        let node = node_at(self.nodes_of(p.story)?, &p.path.0)?;
+        if node.id.is_empty() {
             return None;
         }
-        let index = *p.path.0.first()? as usize;
-        let id = self.ids.get(index)?.clone();
-        let off = if p.path.0.len() == 1 { doc.body.get(index).and_then(|b| b.as_para()).map_or(0, |q| chars_at(&q.text, p.off)) } else { 0 };
-        Some((id, off))
+        let off = doc.para_at(p).map_or(0, |q| chars_at(&q.text, p.off));
+        Some((node.id.clone(), off))
     }
 
-    /// Where someone else's caret is here (from their block id and character offset).
+    /// Where someone else's caret is here (from their paragraph id and character offset).
     pub(crate) fn peer_pos(&self, id: &str, off: usize, doc: &Document) -> Option<Pos> {
-        let index = self.ids.iter().position(|i| i == id)?;
-        let off = doc.body.get(index).and_then(|b| b.as_para()).map_or(0, |q| bytes_at(&q.text, off));
-        Some(Pos { story: StoryRef::Body, path: Path(vec![index as u32]), off })
+        let (story, path) = self.find(id)?;
+        let pos = Pos { story, path: Path(path), off: 0 };
+        let off = doc.para_at(&pos).map_or(0, |q| bytes_at(&q.text, off));
+        Some(Pos { off, ..pos })
     }
 }
 
-/// What someone else's update changed, by the mirror's keys.
+/// What someone else's update changed, by the mirror's keys (`all`: everything, when joining).
 #[derive(Default)]
 struct Changes {
+    all: bool,
     body: bool,
+    /// Blocks (`p:`/`t:`), cell lists (`l:`) and part block lists (`s:`) changed.
     blocks: BTreeSet<String>,
+    cells: BTreeSet<String>,
+    stories: BTreeSet<u32>,
     meta: BTreeSet<String>,
     parts: BTreeSet<String>,
     comments: BTreeSet<String>,
@@ -875,7 +1279,7 @@ impl Session {
         self.collab_peers.clear();
     }
 
-    /// This person's caret for the others: (block id, character offset).
+    /// This person's caret for the others: (paragraph id, character offset).
     pub fn collab_presence(&self) -> Option<(String, usize)> {
         self.collab.as_ref()?.presence_of(&self.sel.focus, &self.doc)
     }
@@ -917,6 +1321,7 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wordcraft_doc::PartKind;
 
     fn session(text: &str) -> Session {
         let mut s = Session::new(Document::new());
@@ -934,12 +1339,35 @@ mod tests {
         }
     }
 
-    fn pair_sessions(text: &str) -> (Session, Session) {
-        let mut a = session(text);
+    fn share(a: &mut Session) -> Session {
         let snapshot = a.collab_seed().unwrap();
         let mut b = Session::new(Document::new());
         b.collab_join(&snapshot).unwrap();
+        b
+    }
+
+    fn pair_sessions(text: &str) -> (Session, Session) {
+        let mut a = session(text);
+        let b = share(&mut a);
         (a, b)
+    }
+
+    fn caret(s: &mut Session, story: StoryRef, path: &[u32], off: usize) {
+        s.sel = crate::Selection::caret(Pos { story, path: Path(path.to_vec()), off });
+    }
+
+    /// A paragraph, a 2×2 table (a b / c d) and the paragraph after it.
+    fn with_table() -> Document {
+        let mut d = Document::new();
+        let row = |x: &str, y: &str| Row { props: Default::default(), cells: vec![Cell::with_text(x), Cell::with_text(y)], controls: Default::default() };
+        let t = Table { props: Default::default(), grid: vec![100.0, 100.0], rows: vec![row("a", "b"), row("c", "d")], controls: Default::default() };
+        d.body = vec![para_block(Paragraph::with_text("antes", Default::default())), Arc::new(Block::Table(t)), para_block(Paragraph::new())];
+        d
+    }
+
+    fn cell(s: &Session, r: usize, c: usize) -> String {
+        let t = s.doc.body[1].as_table().expect("the table");
+        t.rows[r].cells[c].blocks.iter().filter_map(|b| b.as_para().map(|p| p.text.clone())).collect::<Vec<_>>().join("|")
     }
 
     #[test]
@@ -986,5 +1414,85 @@ mod tests {
         pass(&mut a, &mut b);
         assert_eq!(texts(&a), vec!["Bbase"]);
         assert_eq!(texts(&b), vec!["Bbase"]);
+    }
+
+    #[test]
+    fn typing_in_two_cells_of_a_table_keeps_both() {
+        let mut a = Session::new(with_table());
+        let mut b = share(&mut a);
+        assert_eq!(cell(&b, 1, 1), "d");
+        // A types in the first cell, B in the last one, at the same time; then both in the same.
+        caret(&mut a, StoryRef::Body, &[1, 0, 0, 0], 1);
+        a.run("text.insert", &json!({"text": "X"})).unwrap();
+        caret(&mut b, StoryRef::Body, &[1, 1, 1, 0], 0);
+        b.run("text.insert", &json!({"text": "Y"})).unwrap();
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        caret(&mut b, StoryRef::Body, &[1, 0, 0, 0], 0);
+        b.run("text.insert", &json!({"text": "Z"})).unwrap();
+        a.run("text.insert", &json!({"text": "W"})).unwrap();
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        for s in [&a, &b] {
+            assert_eq!(cell(s, 0, 0), "ZaXW");
+            assert_eq!(cell(s, 1, 1), "Yd");
+            assert_eq!(cell(s, 0, 1), "b");
+        }
+        // B's caret is still in the first cell, after its Z.
+        assert_eq!(b.sel.focus, Pos { story: StoryRef::Body, path: Path(vec![1, 0, 0, 0]), off: 1 });
+    }
+
+    #[test]
+    fn a_new_row_and_typing_in_a_cell_keep_both() {
+        let mut a = Session::new(with_table());
+        let mut b = share(&mut a);
+        caret(&mut a, StoryRef::Body, &[1, 0, 1, 0], 1);
+        a.run("text.insert", &json!({"text": "X"})).unwrap();
+        caret(&mut b, StoryRef::Body, &[1, 1, 0, 0], 0);
+        b.run("table.insertRowBelow", &json!({})).unwrap();
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        for s in [&a, &b] {
+            assert_eq!(s.doc.body[1].as_table().unwrap().rows.len(), 3);
+            assert_eq!(cell(s, 0, 1), "bX");
+            assert_eq!(cell(s, 1, 0), "c");
+        }
+        // And text typed in the new row reaches the other.
+        caret(&mut b, StoryRef::Body, &[1, 2, 0, 0], 0);
+        b.run("text.insert", &json!({"text": "nova"})).unwrap();
+        pass(&mut b, &mut a);
+        assert_eq!(cell(&a, 2, 0), cell(&b, 2, 0));
+        assert!(cell(&a, 2, 0).to_lowercase().starts_with("nova"), "{}", cell(&a, 2, 0));
+    }
+
+    #[test]
+    fn typing_in_a_header_keeps_both() {
+        let mut d = Document::new();
+        d.parts.insert(1, Part { kind: PartKind::Header, blocks: vec![para_block(Paragraph::with_text("cab", Default::default()))], body: Default::default() });
+        let mut a = Session::new(d);
+        let mut b = share(&mut a);
+        assert_eq!(b.doc.parts.get(&1).map(|p| p.blocks.len()), Some(1));
+        caret(&mut a, StoryRef::Part(1), &[0], 3);
+        a.run("text.insert", &json!({"text": "X"})).unwrap();
+        caret(&mut b, StoryRef::Part(1), &[0], 0);
+        b.run("text.insert", &json!({"text": "Y"})).unwrap();
+        pass(&mut a, &mut b);
+        pass(&mut b, &mut a);
+        let header = |s: &Session| s.doc.parts[&1].blocks[0].as_para().unwrap().text.clone();
+        assert_eq!(header(&a), "YcabX");
+        assert_eq!(header(&b), "YcabX");
+    }
+
+    #[test]
+    fn a_caret_in_a_cell_or_header_is_found_by_the_other() {
+        let mut d = with_table();
+        d.parts.insert(4, Part { kind: PartKind::Footer, blocks: vec![para_block(Paragraph::with_text("rodapé", Default::default()))], body: Default::default() });
+        let mut a = Session::new(d);
+        let b = share(&mut a);
+        for (story, path, off) in [(StoryRef::Body, vec![1, 1, 0, 0], 1), (StoryRef::Part(4), vec![0], 3), (StoryRef::Body, vec![0], 2)] {
+            caret(&mut a, story, &path, off);
+            let (id, chars) = a.collab_presence().expect("a presence");
+            assert_eq!(b.collab_peer_pos(&id, chars), Some(Pos { story, path: Path(path.clone()), off }));
+        }
     }
 }

@@ -10,7 +10,8 @@
 //! - `wordcraft:collab-snapshot-request`: the whole shared document, for someone joining.
 //! - `wordcraft:collab-stop`.
 //! - `wordcraft:collab-peers` `{ json: [{ id, name, color: "#rrggbb", block, off }] }`: the others'
-//!   carets (the block's id and the character offset), drawn in their colours.
+//!   carets (their paragraph's id, in the body, a cell or a header, and the character offset),
+//!   drawn in their colours.
 //!
 //! To the host: `wordcraft:collab-update` `{ bytes }` with this person's changes,
 //! `wordcraft:collab-snapshot` `{ bytes }`, `wordcraft:collab-state` `{ active, error? }`, and
