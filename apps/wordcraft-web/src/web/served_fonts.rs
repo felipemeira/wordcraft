@@ -27,6 +27,13 @@ const SERVED: &[&str] = &[
     "Tinos-Bold.ttf",
     "Tinos-Italic.ttf",
     "Tinos-BoldItalic.ttf",
+    // Verto: Raleway and Arvo (Google Fonts, OFL), used in its documents.
+    "Raleway-Variable.ttf",
+    "Raleway-Italic-Variable.ttf",
+    "Arvo-Regular.ttf",
+    "Arvo-Bold.ttf",
+    "Arvo-Italic.ttf",
+    "Arvo-BoldItalic.ttf",
 ];
 
 /// Fetch and add every served font the site has.

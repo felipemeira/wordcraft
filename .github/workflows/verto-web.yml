@@ -22,7 +22,7 @@ env:
   CRAFT_FONTS_REF: b076417b5880bd4154bd22f00695b1d28c6bea83
   # googlefonts/noto-emoji commit the emoji font is taken from (OFL 1.1).
   EMOJI_REF: 1ffdd21391dd1f25c081fa93a9dea0c7c029442b
-  # google/fonts commit Arimo, Carlito and Tinos are taken from (OFL 1.1).
+  # google/fonts commit Arimo, Carlito, Tinos, Raleway and Arvo are taken from (OFL 1.1).
   GFONTS_REF: 7af0d90b4d532ffa4b041937b560c6df4e7b1e95
 
 jobs:
@@ -109,6 +109,19 @@ jobs:
           get carlito/OFL.txt OFL-carlito.txt
           # Tinos has no OFL.txt in google/fonts; its METADATA.pb names the licence (OFL).
           get tinos/METADATA.pb LICENSE-tinos-METADATA.pb
+          ls -l "$SITE/fonts"
+      - name: Add Raleway and Arvo (Verto)
+        run: |
+          set -euo pipefail
+          g="https://raw.githubusercontent.com/google/fonts/$GFONTS_REF/ofl"
+          get() { curl --proto '=https' -fsSL -o "$SITE/fonts/$2" "$g/$1"; }
+          get "raleway/Raleway%5Bwght%5D.ttf" Raleway-Variable.ttf
+          get "raleway/Raleway-Italic%5Bwght%5D.ttf" Raleway-Italic-Variable.ttf
+          get raleway/OFL.txt OFL-raleway.txt
+          for s in Regular Bold Italic BoldItalic; do
+            get "arvo/Arvo-$s.ttf" "Arvo-$s.ttf"
+          done
+          get arvo/OFL.txt OFL-arvo.txt
           ls -l "$SITE/fonts"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
