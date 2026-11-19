@@ -34,8 +34,14 @@ enum Incoming {
     Peers(String),
 }
 
+/// Updates and the caret go out at most this often (ms): typing is a command a key.
+const SEND_EVERY_MS: f64 = 300.0;
+
 pub struct Link {
     queue: Rc<RefCell<VecDeque<Incoming>>>,
+    ctx: egui::Context,
+    /// When this person's changes last went out (`Date.now()`).
+    sent_at: std::cell::Cell<f64>,
     /// The presence last sent, so it is sent again only when it changes.
     presence: RefCell<Option<String>>,
     _listener: Closure<dyn FnMut(web_sys::MessageEvent)>,
@@ -53,6 +59,7 @@ impl Link {
         let origin = window.location().origin().ok()?;
         let queue: Rc<RefCell<VecDeque<Incoming>>> = Rc::default();
         let q = queue.clone();
+        let repaint = ctx.clone();
         let listener = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |ev: web_sys::MessageEvent| {
             if ev.origin() != origin {
                 return;
@@ -77,7 +84,7 @@ impl Link {
             }
         });
         window.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref()).ok()?;
-        Some(Link { queue, presence: RefCell::new(None), _listener: listener })
+        Some(Link { queue, ctx: repaint, sent_at: std::cell::Cell::new(0.0), presence: RefCell::new(None), _listener: listener })
     }
 
     /// Takes in what the host sent since the last frame, then hands the host this person's
@@ -115,7 +122,18 @@ impl Link {
                 Incoming::Peers(json) => app.session.collab_peers = peers(&json),
             }
         }
-        for update in app.session.collab_outbox() {
+        let now = js_sys::Date::now();
+        let wait = SEND_EVERY_MS - (now - self.sent_at.get());
+        if wait > 0.0 {
+            // Typing: what changed goes out together a moment later.
+            self.ctx.request_repaint_after(std::time::Duration::from_millis(wait as u64 + 1));
+            return;
+        }
+        let updates = app.session.collab_outbox();
+        if !updates.is_empty() {
+            self.sent_at.set(now);
+        }
+        for update in updates {
             post("wordcraft:collab-update", Some(&update), None);
         }
         let presence = app.session.collab_presence().map(|(block, off)| serde_json::json!({"block": block, "off": off}).to_string());

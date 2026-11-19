@@ -395,7 +395,12 @@ impl Collab {
         self.doc.export(ExportMode::Snapshot).map_err(err)
     }
 
+    /// The updates for the others made since the last call (typing commits each key; they go
+    /// out together, as one update, when the page asks).
     pub fn take_outbox(&mut self) -> Vec<Vec<u8>> {
+        if let Err(e) = self.flush() {
+            log::warn!("{e}");
+        }
         std::mem::take(&mut self.outbox)
     }
 
@@ -594,7 +599,9 @@ impl Collab {
             self.ids = ids;
         }
         self.write_doc_fields(Some(&self.base.clone()), after)?;
-        self.flush()?;
+        // Committed now (one undo step per command); exported for the others with the next
+        // `take_outbox`.
+        self.doc.commit();
         self.base = after.clone();
         Ok(())
     }
@@ -602,6 +609,8 @@ impl Collab {
     /// Takes in an update from someone else: the document with their changes, or `None` when it
     /// changed nothing here.
     pub fn receive(&mut self, update: &[u8]) -> R<Option<Document>> {
+        // This person's changes not yet handed out go first: what comes in counts as sent.
+        self.flush()?;
         let before = self.doc.state_frontiers();
         self.doc.import(update).map_err(err)?;
         let after = self.doc.state_frontiers();
