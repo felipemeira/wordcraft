@@ -957,7 +957,9 @@ mod tests {
         a.run("select.all", &json!({})).unwrap();
         a.run("format.bold", &json!({})).unwrap();
         pass(&mut a, &mut b);
-        assert_eq!(texts(&b), vec!["primeira", "segunda"]);
+        // (AutoCorrect capitalises the first word when Enter ends it.)
+        assert_eq!(texts(&b), vec!["Primeira", "segunda"]);
+        assert_eq!(texts(&b), texts(&a));
         let bold = |s: &Session| s.doc.body.iter().filter_map(|x| x.as_para()).all(|p| p.runs.iter().all(|r| r.props.bold == Some(true)));
         assert!(bold(&a), "A's paragraphs are bold");
         assert!(bold(&b), "B sees them bold");
